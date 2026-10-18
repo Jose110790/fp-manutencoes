@@ -1,0 +1,7 @@
+<!doctype html><html lang="pt-BR"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>{{ title or 'FP Manutenções' }}</title><link rel="stylesheet" href="{{ url_for('static',filename='style.css') }}"></head><body>
+{% if session.get('logged_in') %}
+<header class="top"><a class="brand" href="{{ url_for('dashboard') }}" style="color:white;text-decoration:none"><span class="logo">FP</span><span>FP Manutenções<br><small style="font-weight:400;color:#eee5ff">Gestão do buffet</small></span></a>
+<nav class="nav"><a href="{{ url_for('dashboard') }}">Painel</a><a href="{{ url_for('users') }}">Usuários</a><a href="{{ url_for('areas') }}">Ambientes</a><a href="{{ url_for('assets') }}">Equipamentos</a><a href="{{ url_for('orders') }}">Ordens</a><a href="{{ url_for('quotes') }}">Orçamentos</a><a href="{{ url_for('routines') }}">Rotinas</a><a href="{{ url_for('logout') }}">Sair</a></nav></header>
+{% endif %}
+<main>{% for message in get_flashed_messages() %}<div class="flash">{{ message }}</div>{% endfor %}{% block content %}{% endblock %}</main>
+<div class="footer">FP Manutenções · Protótipo MVP · Cores provisórias inspiradas em uma identidade infantil</div></body></html>
