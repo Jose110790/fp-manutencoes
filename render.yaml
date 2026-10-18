@@ -1,0 +1,25 @@
+services:
+  - type: web
+    name: fp-manutencoes
+    runtime: python
+    plan: starter
+    buildCommand: pip install -r requirements.txt
+    startCommand: gunicorn app:app --workers 2 --threads 4 --timeout 120
+    healthCheckPath: /healthz
+    envVars:
+      - key: FP_ENV
+        value: production
+      - key: FP_SECRET_KEY
+        generateValue: true
+      - key: FP_ADMIN_PASSWORD
+        sync: false
+      - key: FP_DB_PATH
+        value: /var/data/fp_manutencoes.db
+      - key: FP_UPLOAD_DIR
+        value: /var/data/uploads
+      - key: FP_QR_DIR
+        value: /var/data/qrcodes
+    disk:
+      name: fp-manutencoes-data
+      mountPath: /var/data
+      sizeGB: 1
