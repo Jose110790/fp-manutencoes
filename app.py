@@ -34,7 +34,8 @@ def init_db():
         c.executescript("""
         CREATE TABLE IF NOT EXISTS users (
           id INTEGER PRIMARY KEY AUTOINCREMENT, name TEXT NOT NULL, phone TEXT DEFAULT '',
-          role TEXT NOT NULL, email TEXT DEFAULT '', active INTEGER DEFAULT 1, created_at TEXT NOT NULL
+          role TEXT NOT NULL, email TEXT DEFAULT '', username TEXT, password_hash TEXT,
+          active INTEGER DEFAULT 1, created_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS areas (
           id INTEGER PRIMARY KEY AUTOINCREMENT, code TEXT UNIQUE, name TEXT NOT NULL,
@@ -88,11 +89,29 @@ def init_db():
           FOREIGN KEY(quote_id) REFERENCES quotes(id) ON DELETE CASCADE
         );
         """)
+        # Migrate existing installations without deleting user records.
+        user_columns = {row[1] for row in c.execute("PRAGMA table_info(users)").fetchall()}
+        if "username" not in user_columns:
+            c.execute("ALTER TABLE users ADD COLUMN username TEXT")
+        if "password_hash" not in user_columns:
+            c.execute("ALTER TABLE users ADD COLUMN password_hash TEXT")
+        c.execute("CREATE UNIQUE INDEX IF NOT EXISTS idx_users_username ON users(username) WHERE username IS NOT NULL AND username <> ''")
         if not c.execute("SELECT id FROM users LIMIT 1").fetchone():
             c.execute("INSERT INTO users(name,role,created_at) VALUES(?,?,?)",
                       ("Gestora do buffet","Gestora",datetime.now().isoformat(timespec="seconds")))
             c.execute("INSERT INTO users(name,role,created_at) VALUES(?,?,?)",
                       ("Zelador","Zelador",datetime.now().isoformat(timespec="seconds")))
+        # Bootstrap the first individual manager account using the secret already configured in Render.
+        admin_password = os.environ.get("FP_ADMIN_PASSWORD", "").strip()
+        admin_username = os.environ.get("FP_ADMIN_USERNAME", "gestora").strip().lower()
+        if admin_password and not c.execute("SELECT id FROM users WHERE password_hash IS NOT NULL LIMIT 1").fetchone():
+            existing = c.execute("SELECT id FROM users WHERE role IN ('Gestora','Administrador') ORDER BY id LIMIT 1").fetchone()
+            if existing:
+                c.execute("UPDATE users SET username=?, password_hash=? WHERE id=?",
+                          (admin_username, generate_password_hash(admin_password), existing["id"]))
+            else:
+                c.execute("INSERT INTO users(name,role,username,password_hash,created_at) VALUES(?,?,?,?,?)",
+                          ("Gestora principal", "Gestora", admin_username, generate_password_hash(admin_password), datetime.now().isoformat(timespec="seconds")))
         if not c.execute("SELECT id FROM areas LIMIT 1").fetchone():
             defaults = [("Salão principal","Salão"),("Cozinha","Cozinha"),("Banheiro feminino","Banheiro"),("Área dos brinquedos","Recreação")]
             for i,(n,cat) in enumerate(defaults,1):
@@ -111,8 +130,24 @@ init_db()
 def login_required(f):
     @wraps(f)
     def wrapped(*args, **kwargs):
-        if not session.get("logged_in"):
+        if not session.get("user_id"):
             return redirect(url_for("login", next=request.path))
+        current = getrow("SELECT id, name, role, username, active FROM users WHERE id=?", (session["user_id"],))
+        if not current or not current["active"]:
+            session.clear()
+            return redirect(url_for("login"))
+        session["logged_in"] = True
+        session["role"] = current["role"]
+        session["user_name"] = current["name"]
+        return f(*args, **kwargs)
+    return wrapped
+
+def manager_required(f):
+    @wraps(f)
+    @login_required
+    def wrapped(*args, **kwargs):
+        if session.get("role") not in ("Gestora", "Administrador"):
+            abort(403)
         return f(*args, **kwargs)
     return wrapped
 
@@ -142,7 +177,7 @@ def save_upload(fileobj):
 
 @app.context_processor
 def globals_for_templates():
-    return {"today": date.today().isoformat()}
+    return {"today": date.today().isoformat(), "current_role": session.get("role"), "current_user_name": session.get("user_name")}
 
 @app.route("/healthz")
 def healthz():
@@ -150,12 +185,18 @@ def healthz():
 
 @app.route("/login", methods=["GET","POST"])
 def login():
-    if request.method=="POST":
-        password=os.environ.get("FP_ADMIN_PASSWORD","FPtrocar123!")
-        if request.form.get("password")==password:
-            session["logged_in"]=True
+    if request.method == "POST":
+        username = request.form.get("username", "").strip().lower()
+        password = request.form.get("password", "")
+        user = getrow("SELECT * FROM users WHERE lower(username)=? AND active=1", (username,))
+        if user and user["password_hash"] and check_password_hash(user["password_hash"], password):
+            session.clear()
+            session["user_id"] = user["id"]
+            session["logged_in"] = True
+            session["role"] = user["role"]
+            session["user_name"] = user["name"]
             return redirect(request.args.get("next") or url_for("dashboard"))
-        flash("Senha incorreta.")
+        flash("Usuário ou senha inválidos. Confira seus dados ou peça ajuda à gestora.")
     return render_template("login.html")
 
 @app.route("/logout")
@@ -180,22 +221,61 @@ def dashboard():
     return render_template("dashboard.html", stats=stats, recent=recent)
 
 @app.route("/users", methods=["GET","POST"])
-@login_required
+@manager_required
 def users():
-    if request.method=="POST":
-        name=request.form.get("name","").strip()
-        role=request.form.get("role","Funcionário")
-        if not name: flash("Informe o nome.")
+    allowed_roles = {"Gestora", "Zelador", "Funcionário", "Técnico de manutenção"}
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        username = request.form.get("username", "").strip().lower()
+        password = request.form.get("password", "")
+        role = request.form.get("role", "Funcionário")
+        email = request.form.get("email", "").strip().lower()
+        if not name or not username or not password:
+            flash("Preencha nome, usuário e senha inicial.")
+        elif len(username) < 3 or any(ch.isspace() for ch in username):
+            flash("O usuário deve ter pelo menos 3 caracteres e não pode conter espaços.")
+        elif len(password) < 10:
+            flash("A senha inicial precisa ter pelo menos 10 caracteres.")
+        elif role not in allowed_roles:
+            flash("Perfil inválido.")
+        elif getrow("SELECT id FROM users WHERE lower(username)=?", (username,)):
+            flash("Esse nome de usuário já está cadastrado.")
         else:
-            with db() as c: c.execute("INSERT INTO users(name,phone,role,email,created_at) VALUES(?,?,?,?,?)",
-                (name,request.form.get("phone","").strip(),role,request.form.get("email","").strip(),datetime.now().isoformat(timespec="seconds")))
-            flash("Usuário cadastrado.")
+            with db() as c:
+                c.execute("INSERT INTO users(name,phone,role,email,username,password_hash,created_at) VALUES(?,?,?,?,?,?,?)",
+                    (name, request.form.get("phone", "").strip(), role, email, username,
+                     generate_password_hash(password), datetime.now().isoformat(timespec="seconds")))
+            flash(f"Acesso criado para {name}. Entregue o usuário e a senha inicial diretamente à pessoa.")
         return redirect(url_for("users"))
     return render_template("users.html", users=rowlist("SELECT * FROM users ORDER BY id DESC"))
+
+@app.route("/change-password", methods=["GET", "POST"])
+@login_required
+def change_password():
+    if request.method == "POST":
+        old = request.form.get("old_password", "")
+        new = request.form.get("new_password", "")
+        confirm = request.form.get("confirm_password", "")
+        user = getrow("SELECT * FROM users WHERE id=?", (session["user_id"],))
+        if not user or not user["password_hash"] or not check_password_hash(user["password_hash"], old):
+            flash("A senha atual está incorreta.")
+        elif len(new) < 10:
+            flash("A nova senha precisa ter pelo menos 10 caracteres.")
+        elif new != confirm:
+            flash("A confirmação da nova senha não confere.")
+        else:
+            with db() as c:
+                c.execute("UPDATE users SET password_hash=? WHERE id=?", (generate_password_hash(new), user["id"]))
+            session.clear()
+            flash("Senha alterada. Entre novamente com a nova senha.")
+            return redirect(url_for("login"))
+    return render_template("change_password.html")
 
 @app.route("/areas", methods=["GET","POST"])
 @login_required
 def areas():
+    if request.method == "POST" and session.get("role") not in ("Gestora", "Administrador"):
+        abort(403)
     if request.method=="POST":
         name=request.form.get("name","").strip()
         if not name: flash("Informe o nome do ambiente.")
@@ -221,6 +301,8 @@ def area_detail(area_id):
 @app.route("/assets", methods=["GET","POST"])
 @login_required
 def assets():
+    if request.method == "POST" and session.get("role") not in ("Gestora", "Administrador"):
+        abort(403)
     if request.method=="POST":
         name=request.form.get("name","").strip()
         if not name: flash("Informe o nome do equipamento.")
@@ -289,7 +371,7 @@ def order_detail(order_id):
       users=rowlist("SELECT * FROM users WHERE active=1 ORDER BY name"))
 
 @app.route("/orders/<int:order_id>/quote-link")
-@login_required
+@manager_required
 def quote_link(order_id):
     w=getrow("SELECT * FROM work_orders WHERE id=?",(order_id,))
     if not w: abort(404)
@@ -366,7 +448,7 @@ def quotes():
     return render_template("quotes.html", quotes=qs)
 
 @app.route("/quotes/<int:quote_id>", methods=["GET","POST"])
-@login_required
+@manager_required
 def quote_detail(quote_id):
     q=getrow("""SELECT q.*,w.code order_code,w.title order_title FROM quotes q JOIN work_orders w ON w.id=q.work_order_id WHERE q.id=?""",(quote_id,))
     if not q: abort(404)
